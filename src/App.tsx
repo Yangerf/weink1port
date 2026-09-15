@@ -1,215 +1,91 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Installation, SECTIONS, type SectionId, type Telemetry } from './lib/installation';
-import { Ambience } from './lib/audio';
-import { Cursor, type CursorMode } from './ui/Cursor';
-import { Loader } from './ui/Loader';
-import { Hud } from './ui/Hud';
-import { Panel, WorkDetail } from './ui/Panels';
+import { AudioEngine } from '@/game/audio';
+import { emptyStats, type GameEventKind, type GameStats } from '@/game/config';
+import { Game, loadBest, type Command } from '@/game/game';
+import { Hud } from '@/ui/Hud';
+import { GameOverOverlay, MenuOverlay, PauseOverlay } from '@/ui/Overlays';
 
 export default function App() {
-  const stage = useRef<HTMLDivElement>(null);
-  const engine = useRef<Installation | null>(null);
-  const audio = useRef<Ambience | null>(null);
-  const telemetry = useRef<Telemetry>({ cam: '0.00 / 0.00 / 0.00', cursor: '0.000 0.000', fps: 60, drops: 0 });
+  const hostRef = useRef<HTMLDivElement>(null);
+  const gameRef = useRef<Game | null>(null);
+  const audioRef = useRef<AudioEngine | null>(null);
+  const flashId = useRef(0);
 
-  const [progress, setProgress] = useState(0);
-  const [label, setLabel] = useState('BOOT');
-  const [ready, setReady] = useState(false);
-  const [hidden, setHidden] = useState(false);
-  const [opened, setOpened] = useState(false);
-  const [section, setSection] = useState<SectionId>('HOME');
-  const [detail, setDetail] = useState<number | null>(null);
-  const [cursor, setCursor] = useState<CursorMode>('idle');
-  const [audioOn, setAudioOn] = useState(false);
-
-  const openedRef = useRef(false);
-  const sectionRef = useRef<SectionId>('HOME');
-
-  const goSection = useCallback((s: SectionId) => {
-    if (!engine.current) return;
-    engine.current.setSection(s);
-    sectionRef.current = s;
-    openedRef.current = true;
-    setOpened(true);
-    setSection(s);
-    setDetail(null);
-  }, []);
+  const [stats, setStats] = useState<GameStats>(() => emptyStats(loadBest()));
+  const [finalStats, setFinalStats] = useState<GameStats | null>(null);
+  const [muted, setMuted] = useState(false);
+  const [flash, setFlash] = useState<{ kind: GameEventKind; id: number } | null>(null);
 
   useEffect(() => {
-    if (!stage.current) return;
-    let mounted = true;
+    const host = hostRef.current;
+    if (!host) return;
+    const audio = new AudioEngine();
+    audioRef.current = audio;
 
-    const inst = new Installation({
-      container: stage.current,
-      onProgress: (p, l) => {
-        if (!mounted) return;
-        setProgress(p);
-        setLabel(l);
+    const game = new Game(host, audio, {
+      onStats: (s) => {
+        setStats(s);
+        if (s.state === 'playing') setFinalStats(null);
       },
-      onReady: () => {
-        if (!mounted) return;
-        setReady(true);
-        window.setTimeout(() => mounted && setHidden(true), 1100);
+      onEvent: (kind) => {
+        flashId.current += 1;
+        setFlash({ kind, id: flashId.current });
       },
-      onHover: (target) => {
-        if (!mounted) return;
-        setCursor(target === 'text' ? 'hot' : typeof target === 'number' ? 'link' : 'idle');
-      },
-      onTextClick: () => {
-        if (!mounted) return;
-        if (!openedRef.current) {
-          engine.current?.open();
-          openedRef.current = true;
-          setOpened(true);
-          setSection('HOME');
-        } else if (sectionRef.current !== 'HOME') {
-          goSection('HOME');
-        } else {
-          engine.current?.pulse(0.9);
-        }
-      },
-      onWorkClick: (i) => mounted && setDetail(i),
-      onTelemetry: (t) => {
-        telemetry.current = t;
-      },
+      onDeath: (s) => setFinalStats(s),
     });
-    engine.current = inst;
-    inst.init().catch((err) => {
-      console.error('[WEINK1] init failed', err);
-      setLabel('WEBGL UNAVAILABLE');
-    });
+    gameRef.current = game;
 
     return () => {
-      mounted = false;
-      inst.dispose();
-      engine.current = null;
+      game.dispose();
+      gameRef.current = null;
+      audio.dispose();
+      audioRef.current = null;
     };
-  }, [goSection]);
-
-  // keyboard + wheel navigation
-  useEffect(() => {
-    const idx = () => SECTIONS.indexOf(sectionRef.current);
-
-    const key = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        setDetail(null);
-        return;
-      }
-      const num = parseInt(e.key, 10);
-      if (num >= 1 && num <= SECTIONS.length) {
-        goSection(SECTIONS[num - 1]);
-        return;
-      }
-      if (!openedRef.current) {
-        if (e.key === 'Enter' || e.key === ' ') {
-          engine.current?.open();
-          openedRef.current = true;
-          setOpened(true);
-        }
-        return;
-      }
-      if (e.key === 'ArrowDown' || e.key === 'ArrowRight') goSection(SECTIONS[Math.min(SECTIONS.length - 1, idx() + 1)]);
-      if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') goSection(SECTIONS[Math.max(0, idx() - 1)]);
-    };
-
-    let lock = 0;
-    const wheel = (e: WheelEvent) => {
-      const now = performance.now();
-      if (now < lock || Math.abs(e.deltaY) < 8) return;
-      lock = now + 900;
-      if (!openedRef.current) {
-        engine.current?.open();
-        openedRef.current = true;
-        setOpened(true);
-        return;
-      }
-      const dir = e.deltaY > 0 ? 1 : -1;
-      const n = Math.max(0, Math.min(SECTIONS.length - 1, idx() + dir));
-      goSection(SECTIONS[n]);
-    };
-
-    let sy = 0;
-    const tStart = (e: TouchEvent) => {
-      sy = e.touches[0].clientY;
-    };
-    const tEnd = (e: TouchEvent) => {
-      const dy = sy - (e.changedTouches[0]?.clientY ?? sy);
-      if (Math.abs(dy) < 60) return;
-      if (!openedRef.current) {
-        engine.current?.open();
-        openedRef.current = true;
-        setOpened(true);
-        return;
-      }
-      const n = Math.max(0, Math.min(SECTIONS.length - 1, idx() + (dy > 0 ? 1 : -1)));
-      goSection(SECTIONS[n]);
-    };
-
-    window.addEventListener('keydown', key);
-    window.addEventListener('wheel', wheel, { passive: true });
-    window.addEventListener('touchstart', tStart, { passive: true });
-    window.addEventListener('touchend', tEnd, { passive: true });
-    return () => {
-      window.removeEventListener('keydown', key);
-      window.removeEventListener('wheel', wheel);
-      window.removeEventListener('touchstart', tStart);
-      window.removeEventListener('touchend', tEnd);
-    };
-  }, [goSection]);
-
-  const toggleAudio = useCallback(() => {
-    audio.current ??= new Ambience();
-    setAudioOn(audio.current.toggle());
-    engine.current?.pulse(0.3);
   }, []);
 
-  useEffect(() => () => audio.current?.dispose(), []);
+  const command = useCallback((c: Command) => {
+    const g = gameRef.current;
+    if (!g) return;
+    if (c === 'start' || c === 'restart') {
+      audioRef.current?.init();
+      audioRef.current?.resume();
+    }
+    g.command(c);
+  }, []);
 
-  const hoverOn = useCallback(() => setCursor('link'), []);
-  const hoverOff = useCallback(() => setCursor('idle'), []);
+  const toggleMute = useCallback(() => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.init();
+    const next = !muted;
+    audio.setMuted(next);
+    setMuted(next);
+  }, [muted]);
+
+  const inMenu = stats.state === 'menu';
 
   return (
-    <div className="no-cursor">
-      <div className="stage" ref={stage} />
+    <div className="app">
+      <div className="stage" ref={hostRef} />
 
-      {!hidden && <Loader progress={progress} label={label} done={ready} />}
+      <div className="vignette" />
+      <div className="scanlines" />
 
-      {ready && (
-        <>
-          <Hud
-            section={section}
-            opened={opened}
-            telemetry={telemetry}
-            onSection={goSection}
-            audioOn={audioOn}
-            onAudio={toggleAudio}
-            hoverOn={hoverOn}
-            hoverOff={hoverOff}
-          />
+      {flash && <div key={flash.id} className={`event-flash ${flash.kind}`} />}
 
-          <div className={`hint ${opened ? 'hide' : ''}`}>
-            <span className="brk">[</span>
-            CLICK THE MONOLITH TO OPEN
-            <span className="brk r">]</span>
-          </div>
-
-          {opened && (
-            <div className="hud" style={{ pointerEvents: 'none' }}>
-              <Panel section={section} hoverOn={hoverOn} hoverOff={hoverOff} />
-              {detail !== null && section === 'WORK' && (
-                <WorkDetail
-                  index={detail}
-                  onClose={() => setDetail(null)}
-                  hoverOn={hoverOn}
-                  hoverOff={hoverOff}
-                />
-              )}
-            </div>
-          )}
-        </>
+      {!inMenu && (
+        <Hud
+          stats={stats}
+          muted={muted}
+          paused={stats.state === 'paused'}
+          onCommand={command}
+          onToggleMute={toggleMute}
+        />
       )}
 
-      <Cursor mode={cursor} />
+      {inMenu && <MenuOverlay best={stats.best} onCommand={command} />}
+      {stats.state === 'paused' && <PauseOverlay stats={stats} onCommand={command} />}
+      {stats.state === 'dead' && <GameOverOverlay stats={stats} final={finalStats} onCommand={command} />}
     </div>
   );
 }
